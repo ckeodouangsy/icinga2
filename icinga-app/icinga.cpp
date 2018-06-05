@@ -32,6 +32,8 @@
 #include "base/context.hpp"
 #include "base/console.hpp"
 #include "base/process.hpp"
+#include "base/json.hpp"
+#include "base/tcpsocket.hpp"
 #include "config.h"
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -253,7 +255,8 @@ static int Main()
 		("include,I", po::value<std::vector<std::string> >(), "add include search directory")
 		("log-level,x", po::value<std::string>(), "specify the log level for the console log.\n"
 			"The valid value is either debug, notice, information (default), warning, or critical")
-		("script-debugger,X", "whether to enable the script debugger");
+		("script-debugger,X", "whether to enable the script debugger")
+		("env", po::value<std::string>(), "the name of the environment, defaults to \"production\"");
 
 	po::options_description hiddenDesc("Hidden options");
 
@@ -274,6 +277,66 @@ static int Main()
 	} catch (const std::exception& ex) {
 		Log(LogCritical, "icinga-app")
 			<< "Error while parsing command-line options: " << ex.what();
+		return EXIT_FAILURE;
+	}
+
+	if (vm.count("env")) {
+		String env = vm["env"].as<std::string>();
+		ScriptGlobal::Set("Environment", env);
+	}
+
+	String env = ScriptGlobal::Get("Environment", NULL);
+	String cmd = "icinga-agent environments info --json " + Utility::EscapeShellArg(env);
+
+	FILE *fp = popen(cmd.CStr(), "r");
+	std::stringstream msgbuf;
+	while (!ferror(fp) && !feof(fp)) {
+		char buf[512];
+		size_t num = fread(buf, 1, sizeof(buf), fp);
+		msgbuf << std::string(buf, buf + num);
+	}
+	pclose(fp);
+
+	Dictionary::Ptr envInfo;
+	try {
+		envInfo = JsonDecode(msgbuf.str());
+	} catch (const std::exception&) {}
+
+	if (envInfo) {
+		Dictionary::Ptr config = envInfo->Get("config");
+
+		if (!config) {
+			Log(LogCritical, "app")
+			    << "Invalid JSON returned by icinga-agent: " << msgbuf.str();
+			return EXIT_FAILURE;
+		}
+
+		String configPath = config->Get("config_path");
+		String dataPath = config->Get("data_path");
+
+		ScriptGlobal::Set("SysconfDir", configPath);
+		ScriptGlobal::Set("RunDir", dataPath + "/run");
+		ScriptGlobal::Set("LocalStateDir", dataPath);
+
+		TcpSocket::Ptr agentListener = new TcpSocket();
+		agentListener->Bind("127.0.0.1", "0", AF_INET);
+		auto pieces = agentListener->GetClientAddress().Split(":");
+		config->Set("port", Convert::ToLong(pieces[pieces.size() - 1]));
+
+		Dictionary::Ptr envData = new Dictionary({
+			{ "listener", agentListener },
+			{ "config", config },
+			{ "meta_path", config->Get("env_path") + "/config.json" }
+		});
+
+		Log(LogCritical, "app")
+		    << envData->ToString();
+
+		// Make the agent listener available to the ApiListener later on
+		ScriptGlobal::Set("EnvironmentInfo", envData);
+	} else if (env != "production") {
+		Log(LogCritical, "app")
+		    << "No such environment exists: " << env;
 		return EXIT_FAILURE;
 	}
 
